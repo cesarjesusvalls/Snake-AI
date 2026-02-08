@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import warnings
 from datetime import datetime
 import numpy as np
 from typing import List, Tuple, Optional
@@ -12,6 +13,7 @@ from enum import Enum
 import random
 import time
 
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 import pygame
 
 class Action(Enum):
@@ -269,10 +271,12 @@ class SnakeBrain(nn.Module):
     def _get_input_features(self, occupancy_map: np.ndarray, current_direction: Tuple[int, int]) -> torch.Tensor:
         """Get binary input features for the neural network."""
         # Find head position
-        head_pos = tuple(map(int, np.where(occupancy_map == 2)))[::-1]  # Reverse to get (x, y)
-        
+        hy, hx = np.where(occupancy_map == 2)
+        head_pos = (int(hx[0]), int(hy[0]))
+
         # Find food position
-        food_pos = tuple(map(int, np.where(occupancy_map == 3)))[::-1]  # Reverse to get (x, y)
+        fy, fx = np.where(occupancy_map == 3)
+        food_pos = (int(fx[0]), int(fy[0]))
         
         # Get food direction relative to snake's current direction
         food_straight, food_left, food_right = self._get_relative_food_direction(head_pos, food_pos, current_direction)
