@@ -1,13 +1,11 @@
-"""fast_genetics.py — Optimized SnakeAI neuroevolution
+"""smart_genetics.py — SnakeAI neuroevolution with spatial awareness
 
-Performance optimizations over genetics.py:
-  1. Pure Python inference — no PyTorch/numpy in the hot loop (~9x faster forward pass)
-  2. Direct position access — no occupancy map construction, no np.where scans
-  3. Integer dot/cross product for food direction — no trigonometry
-  4. Set-based collision detection — O(1) instead of O(n) list scan
-  5. Deque-based snake body — O(1) tail removal
-  6. Rejection sampling for food placement — faster for short snakes
-  7. Inlined game loop in worker — eliminates method-call overhead
+Enhanced brain inputs over genetics.py:
+  - Tail direction (straight/left/right) — follow your tail to avoid self-trapping
+  - Flood fill reachable space (straight/left/right) — BFS from each next position,
+    normalized by snake length. Detects dead-end pockets before entering them.
+
+Network architecture: 12 inputs → 16 hidden (ReLU) → 3 outputs (LEFT/RIGHT/NOTHING)
 """
 
 import copy
@@ -92,11 +90,6 @@ def load_game_record(path: str) -> GameRecord:
         total_steps=data["total_steps"],
     )
 
-
-# ---------------------------------------------------------------------------
-# SnakeGame — used for visualization / replay / load-brain modes only.
-# The hot evaluation path uses _fast_evaluate() which inlines all game logic.
-# ---------------------------------------------------------------------------
 
 class SnakeGame:
     def __init__(self, board_size: int = 20, cell_size: int = 20):
@@ -228,7 +221,7 @@ class SnakeGame:
             self.steps_without_food += 1
 
         # Check if snake is stuck
-        if self.steps_without_food >= 75:
+        if self.steps_without_food >= 150:
             self.game_over = True
             return False
 
@@ -237,8 +230,7 @@ class SnakeGame:
 
 
 # ---------------------------------------------------------------------------
-# SnakeBrain — nn.Module for weight management, serialization, and viz path.
-# The hot evaluation path uses raw Python lists extracted via get_fast_weights().
+# SnakeBrain — 12 inputs → 16 hidden (ReLU) → 3 outputs
 # ---------------------------------------------------------------------------
 
 class SnakeBrain(nn.Module):
@@ -246,17 +238,16 @@ class SnakeBrain(nn.Module):
         super().__init__()
         self.board_size = board_size
 
-        # Input features (6 binary inputs):
-        # 1. Food is straight ahead
-        # 2. Food is to the left
-        # 3. Food is to the right
-        # 4. Death if continue straight
-        # 5. Death if turn left
-        # 6. Death if turn right
-        input_size = 6
+        # Input features (12 inputs):
+        # 1-3:  Food direction (straight, left, right)
+        # 4-6:  Death checks (straight, left, right)
+        # 7-9:  Tail direction (straight, left, right)
+        # 10-12: Reachable space ratio (straight, left, right)
+        input_size = 12
+        hidden_size = 16
 
-        # Simple network with one hidden layer
-        self.fc1 = nn.Linear(input_size, 3)  # 3 outputs for LEFT, RIGHT, NOTHING
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, 3)  # 3 outputs for LEFT, RIGHT, NOTHING
 
         # Initialize with random weights
         self.apply(self._init_weights)
@@ -270,103 +261,122 @@ class SnakeBrain(nn.Module):
     def get_fast_weights(self):
         """Extract weights as Python lists for fast inference.
 
-        Returns (w, b) where w is a 3x6 nested list and b is a length-3 list.
+        Returns (wh, bh, wo, bo):
+          wh: hidden weights (16x12 nested list)
+          bh: hidden biases (length-16 list)
+          wo: output weights (3x16 nested list)
+          bo: output biases (length-3 list)
         """
-        return self.fc1.weight.data.tolist(), self.fc1.bias.data.tolist()
+        return (
+            self.fc1.weight.data.tolist(),
+            self.fc1.bias.data.tolist(),
+            self.fc2.weight.data.tolist(),
+            self.fc2.bias.data.tolist(),
+        )
 
-    def _check_death(self, occupancy_map: np.ndarray, pos: Tuple[int, int], direction: Tuple[int, int]) -> bool:
-        """Check if moving in the given direction from pos leads to death."""
-        new_x = pos[0] + direction[0]
-        new_y = pos[1] + direction[1]
+    def _flood_fill_count(self, start_x: int, start_y: int,
+                          blocked: set, max_count: int) -> int:
+        """BFS flood fill counting reachable cells. Stops at max_count."""
+        bs = self.board_size
+        if (start_x < 0 or start_x >= bs or start_y < 0 or start_y >= bs
+                or (start_x, start_y) in blocked):
+            return 0
+        visited = {(start_x, start_y)}
+        queue = deque([(start_x, start_y)])
+        count = 1
+        while queue:
+            if count >= max_count:
+                return count
+            x, y = queue.popleft()
+            for nx, ny in ((x+1, y), (x-1, y), (x, y+1), (x, y-1)):
+                if (0 <= nx < bs and 0 <= ny < bs
+                        and (nx, ny) not in blocked and (nx, ny) not in visited):
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+                    count += 1
+                    if count >= max_count:
+                        return count
+        return count
 
-        # Check wall collision
-        if new_x < 0 or new_x >= self.board_size or new_y < 0 or new_y >= self.board_size:
-            return True
+    def _get_input_features(self, occupancy_map: np.ndarray,
+                            current_direction: Tuple[int, int],
+                            snake_positions: List[Tuple[int, int]]) -> torch.Tensor:
+        """Get 12 input features for the neural network."""
+        bs = self.board_size
 
-        # Check self collision
-        return occupancy_map[new_y, new_x] == 1
-
-    def _get_relative_food_direction(self, head_pos: Tuple[int, int], food_pos: Tuple[int, int],
-                                   current_direction: Tuple[int, int]) -> Tuple[bool, bool, bool]:
-        """
-        Determine if food is straight ahead, to the left, or to the right relative to current direction.
-        Returns tuple of (straight, left, right).
-        """
-        dx = food_pos[0] - head_pos[0]
-        dy = food_pos[1] - head_pos[1]
-
-        # Convert current direction to angle
-        current_angle = np.arctan2(current_direction[1], current_direction[0])
-        # Convert food direction to angle
-        food_angle = np.arctan2(dy, dx)
-
-        # Calculate relative angle
-        angle_diff = (food_angle - current_angle + np.pi) % (2 * np.pi) - np.pi
-
-        # Check directions
-        straight = abs(angle_diff) < np.pi/4
-        left = angle_diff > np.pi/4 and angle_diff < 3*np.pi/4
-        right = angle_diff < -np.pi/4 and angle_diff > -3*np.pi/4
-
-        return straight, left, right
-
-    def _get_input_features(self, occupancy_map: np.ndarray, current_direction: Tuple[int, int]) -> torch.Tensor:
-        """Get binary input features for the neural network."""
-        # Find head position
+        # Find head and food positions
         hy, hx = np.where(occupancy_map == 2)
         head_pos = (int(hx[0]), int(hy[0]))
-
-        # Find food position
         fy, fx = np.where(occupancy_map == 3)
         food_pos = (int(fx[0]), int(fy[0]))
+        tail_pos = snake_positions[0]
 
-        # Get food direction relative to snake's current direction
-        food_straight, food_left, food_right = self._get_relative_food_direction(head_pos, food_pos, current_direction)
+        dx, dy = current_direction
+        lx, ly = -dy, dx    # left direction
+        rx, ry = dy, -dx    # right direction
 
-        # Check death conditions for different moves
-        # For straight ahead
-        death_straight = self._check_death(occupancy_map, head_pos, current_direction)
+        # --- Food direction (dot/cross product) ---
+        fdx = food_pos[0] - head_pos[0]
+        fdy = food_pos[1] - head_pos[1]
+        fwd = fdx * dx + fdy * dy
+        lft = fdx * lx + fdy * ly
+        a_lft, a_fwd = abs(lft), abs(fwd)
+        food_straight = float(fwd > 0 and a_lft < a_fwd)
+        food_left = float(lft > 0 and a_fwd < a_lft)
+        food_right = float(lft < 0 and a_fwd < a_lft)
 
-        # For left turn
-        left_dir = (-current_direction[1], current_direction[0])  # Rotate 90° left
-        death_left = self._check_death(occupancy_map, head_pos, left_dir)
+        # --- Death checks ---
+        def is_death(px, py):
+            return (px < 0 or px >= bs or py < 0 or py >= bs
+                    or occupancy_map[py, px] == 1)
+        death_straight = float(is_death(head_pos[0] + dx, head_pos[1] + dy))
+        death_left = float(is_death(head_pos[0] + lx, head_pos[1] + ly))
+        death_right = float(is_death(head_pos[0] + rx, head_pos[1] + ry))
 
-        # For right turn
-        right_dir = (current_direction[1], -current_direction[0])  # Rotate 90° right
-        death_right = self._check_death(occupancy_map, head_pos, right_dir)
+        # --- Tail direction (dot/cross product, same as food) ---
+        tdx = tail_pos[0] - head_pos[0]
+        tdy = tail_pos[1] - head_pos[1]
+        t_fwd = tdx * dx + tdy * dy
+        t_lft = tdx * lx + tdy * ly
+        a_t_lft, a_t_fwd = abs(t_lft), abs(t_fwd)
+        tail_straight = float(t_fwd > 0 and a_t_lft < a_t_fwd)
+        tail_left = float(t_lft > 0 and a_t_fwd < a_t_lft)
+        tail_right = float(t_lft < 0 and a_t_fwd < a_t_lft)
 
-        # Create input tensor
-        inputs = torch.tensor([
-            float(food_straight),
-            float(food_left),
-            float(food_right),
-            float(death_straight),
-            float(death_left),
-            float(death_right)
+        # --- Flood fill (reachable space ratio) ---
+        snake_set = set(snake_positions)
+        snake_len = len(snake_positions)
+        space_s = min(self._flood_fill_count(
+            head_pos[0] + dx, head_pos[1] + dy, snake_set, snake_len) / snake_len, 1.0)
+        space_l = min(self._flood_fill_count(
+            head_pos[0] + lx, head_pos[1] + ly, snake_set, snake_len) / snake_len, 1.0)
+        space_r = min(self._flood_fill_count(
+            head_pos[0] + rx, head_pos[1] + ry, snake_set, snake_len) / snake_len, 1.0)
+
+        return torch.tensor([
+            food_straight, food_left, food_right,
+            death_straight, death_left, death_right,
+            tail_straight, tail_left, tail_right,
+            space_s, space_l, space_r,
         ], dtype=torch.float32)
 
-        return inputs
-
     def forward(self, x):
-        x = F.softmax(self.fc1(x), dim=1)
+        x = F.relu(self.fc1(x))
+        x = F.softmax(self.fc2(x), dim=1)
         return x
 
-    def get_action(self, occupancy_map: np.ndarray, current_direction: Tuple[int, int]) -> Action:
+    def get_action(self, occupancy_map: np.ndarray,
+                   current_direction: Tuple[int, int],
+                   snake_positions: List[Tuple[int, int]]) -> Action:
         """Convert network output to snake action."""
-        # Get input features
-        input_features = self._get_input_features(occupancy_map, current_direction)
+        input_features = self._get_input_features(
+            occupancy_map, current_direction, snake_positions)
 
-        # Add batch dimension
         x = input_features.unsqueeze(0)
-
-        # Get network prediction
         with torch.no_grad():
             action_probs = self(x)
 
-        # Convert to numpy and get action index
         action_idx = action_probs.numpy().argmax()
-
-        # Map index to action (only 3 actions now)
         actions = [Action.LEFT, Action.RIGHT, Action.NOTHING]
         return actions[action_idx]
 
@@ -546,7 +556,7 @@ def simulate_game(brain: SnakeBrain, game: SnakeGame, visualizer: Optional[Snake
 
     while not game.game_over:
         occupancy = game.get_occupancy_map()
-        action = brain.get_action(occupancy, game.current_direction)
+        action = brain.get_action(occupancy, game.current_direction, game.snake_positions)
         actions.append(action)
 
         for event in pygame.event.get():
@@ -594,36 +604,70 @@ def simulate_game(brain: SnakeBrain, game: SnakeGame, visualizer: Optional[Snake
 
 
 # ---------------------------------------------------------------------------
-# Fast evaluation — the core optimization.
-# Runs the full game loop + neural network inference in pure Python.
-# No PyTorch, no numpy, no occupancy maps in the hot path.
+# Flood fill — module-level for worker pickling
 # ---------------------------------------------------------------------------
 
-def _fast_evaluate(w, b, board_size, num_trials):
-    """Evaluate a brain over multiple game trials using pure Python.
+def _flood_fill(start_x, start_y, bs, snake_set, max_count):
+    """BFS flood fill counting reachable cells from (start_x, start_y).
+
+    Treats walls and snake_set cells as impassable. Stops early once
+    reachable count reaches max_count.
+
+    Returns integer count of reachable cells (0 if start is blocked/OOB).
+    """
+    if (start_x < 0 or start_x >= bs or start_y < 0 or start_y >= bs
+            or (start_x, start_y) in snake_set):
+        return 0
+    visited = {(start_x, start_y)}
+    queue = deque([(start_x, start_y)])
+    count = 1
+    while queue:
+        if count >= max_count:
+            return count
+        x, y = queue.popleft()
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if (0 <= nx < bs and 0 <= ny < bs
+                    and (nx, ny) not in snake_set and (nx, ny) not in visited):
+                visited.add((nx, ny))
+                queue.append((nx, ny))
+                count += 1
+                if count >= max_count:
+                    return count
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Fast evaluation — inlined game loop + numpy inference
+# ---------------------------------------------------------------------------
+
+def _fast_evaluate(wh, bh, wo, bo, board_size, num_trials):
+    """Evaluate a brain over multiple game trials.
 
     Args:
-        w: weight matrix as nested list [[w00..w05], [w10..w15], [w20..w25]]
-        b: bias vector as list [b0, b1, b2]
+        wh: hidden layer weights as nested list (16x12)
+        bh: hidden layer biases as list (16)
+        wo: output layer weights as nested list (3x16)
+        bo: output layer biases as list (3)
         board_size: board dimension (e.g. 20)
         num_trials: number of games to average over
 
     Returns:
         (avg_score, best_game_record)
     """
-    # Pre-extract all 21 weight values as locals (avoids list indexing in hot loop)
-    w00, w01, w02, w03, w04, w05 = w[0]
-    w10, w11, w12, w13, w14, w15 = w[1]
-    w20, w21, w22, w23, w24, w25 = w[2]
-    b0, b1, b2 = b
+    # Convert weights to numpy once (numpy matmul faster than Python for 12→16→3)
+    wh_np = np.array(wh, dtype=np.float32)   # (16, 12)
+    bh_np = np.array(bh, dtype=np.float32)   # (16,)
+    wo_np = np.array(wo, dtype=np.float32)   # (3, 16)
+    bo_np = np.array(bo, dtype=np.float32)   # (3,)
 
     bs = board_size
     bs_minus_1 = bs - 1
     start_pos = (bs // 2, bs // 2)
     randint = random.randint
 
-    total_score = 0
-    best_score = -1
+    total_score = 0.0
+    best_fitness = -1.0
+    best_food_score = 0
     best_actions = None
     best_food_positions = None
 
@@ -641,55 +685,65 @@ def _fast_evaluate(w, b, board_size, num_trials):
         food_x, food_y = fx, fy
 
         score = 0
+        total_steps = 0
         steps_without_food = 0
         growth = 0
         actions = []
         food_positions = [(food_x, food_y)]
+        steps_at_last_food = 0
 
         while True:
             hx, hy = snake[-1]
+            snake_len = len(snake)
 
-            # --- Food direction via dot/cross product (no trig) ---
+            # --- Food direction (dot/cross product) ---
             fdx = food_x - hx
             fdy = food_y - hy
-            fwd = fdx * dx + fdy * dy       # forward component
-            lx, ly = -dy, dx                 # left direction
-            lft = fdx * lx + fdy * ly        # leftward component
-
-            # Strict < matches the arctan2 boundary behavior exactly
+            fwd = fdx * dx + fdy * dy
+            lx, ly = -dy, dx
+            lft = fdx * lx + fdy * ly
             a_lft = abs(lft)
             a_fwd = abs(fwd)
             fs = 1.0 if fwd > 0 and a_lft < a_fwd else 0.0
             fl = 1.0 if lft > 0 and a_fwd < a_lft else 0.0
             fr = 1.0 if lft < 0 and a_fwd < a_lft else 0.0
 
-            # --- Death checks (inline, set-based O(1) collision) ---
-            # Straight
+            # --- Death checks (set-based O(1)) ---
             nx, ny = hx + dx, hy + dy
             ds = 1.0 if (nx < 0 or nx > bs_minus_1 or ny < 0 or ny > bs_minus_1
                          or (nx, ny) in snake_set) else 0.0
-            # Left
             nx, ny = hx + lx, hy + ly
             dl = 1.0 if (nx < 0 or nx > bs_minus_1 or ny < 0 or ny > bs_minus_1
                          or (nx, ny) in snake_set) else 0.0
-            # Right
             rx, ry = dy, -dx
             nx, ny = hx + rx, hy + ry
             dr = 1.0 if (nx < 0 or nx > bs_minus_1 or ny < 0 or ny > bs_minus_1
                          or (nx, ny) in snake_set) else 0.0
 
-            # --- Forward pass (unrolled 6->3 matmul, pure Python) ---
-            v0 = b0 + fs*w00 + fl*w01 + fr*w02 + ds*w03 + dl*w04 + dr*w05
-            v1 = b1 + fs*w10 + fl*w11 + fr*w12 + ds*w13 + dl*w14 + dr*w15
-            v2 = b2 + fs*w20 + fl*w21 + fr*w22 + ds*w23 + dl*w24 + dr*w25
+            # --- Tail direction (dot/cross product) ---
+            tx, ty = snake[0]
+            tdx = tx - hx
+            tdy = ty - hy
+            t_fwd = tdx * dx + tdy * dy
+            t_lft = tdx * lx + tdy * ly
+            a_t_lft = abs(t_lft)
+            a_t_fwd = abs(t_fwd)
+            ts = 1.0 if t_fwd > 0 and a_t_lft < a_t_fwd else 0.0
+            tl = 1.0 if t_lft > 0 and a_t_fwd < a_t_lft else 0.0
+            tr = 1.0 if t_lft < 0 and a_t_fwd < a_t_lft else 0.0
 
-            # Argmax -> action index (0=LEFT, 1=RIGHT, 2=NOTHING)
-            if v0 >= v1 and v0 >= v2:
-                best_i = 0
-            elif v1 >= v2:
-                best_i = 1
-            else:
-                best_i = 2
+            # --- Flood fill (reachable space / snake_length, capped at 1.0) ---
+            ss = min(_flood_fill(hx + dx, hy + dy, bs, snake_set, snake_len) / snake_len, 1.0)
+            sl = min(_flood_fill(hx + lx, hy + ly, bs, snake_set, snake_len) / snake_len, 1.0)
+            sr = min(_flood_fill(hx + rx, hy + ry, bs, snake_set, snake_len) / snake_len, 1.0)
+
+            # --- Forward pass (numpy matmul: 12 → 16 ReLU → 3) ---
+            inp = np.array([fs, fl, fr, ds, dl, dr, ts, tl, tr, ss, sl, sr],
+                           dtype=np.float32)
+            hidden = wh_np @ inp + bh_np
+            np.maximum(hidden, 0, out=hidden)  # ReLU in-place
+            output = wo_np @ hidden + bo_np
+            best_i = int(output.argmax())
 
             actions.append(best_i)
 
@@ -698,31 +752,26 @@ def _fast_evaluate(w, b, board_size, num_trials):
                 dx, dy = -dy, dx
             elif best_i == 1:  # RIGHT
                 dx, dy = dy, -dx
-            # NOTHING: direction unchanged
 
             # --- Move ---
             new_hx = hx + dx
             new_hy = hy + dy
 
-            # Wall collision
             if new_hx < 0 or new_hx > bs_minus_1 or new_hy < 0 or new_hy > bs_minus_1:
                 break
-
             new_head = (new_hx, new_hy)
-
-            # Self collision
             if new_head in snake_set:
                 break
 
             snake.append(new_head)
             snake_set.add(new_head)
+            total_steps += 1
 
-            # Food check
             if new_hx == food_x and new_hy == food_y:
                 score += 1
                 steps_without_food = 0
                 growth += 1
-                # Spawn new food (rejection sampling)
+                steps_at_last_food = total_steps
                 while True:
                     fx, fy = randint(0, bs_minus_1), randint(0, bs_minus_1)
                     if (fx, fy) not in snake_set:
@@ -730,7 +779,6 @@ def _fast_evaluate(w, b, board_size, num_trials):
                 food_x, food_y = fx, fy
                 food_positions.append((food_x, food_y))
 
-            # Growth / tail removal
             if growth > 0:
                 growth -= 1
             else:
@@ -738,24 +786,35 @@ def _fast_evaluate(w, b, board_size, num_trials):
                 snake_set.discard(removed)
                 steps_without_food += 1
 
-            # Starvation
-            if steps_without_food >= 75:
+            if steps_without_food >= 150:
                 break
 
-        total_score += score
-        if score > best_score:
-            best_score = score
+        # Fitness = score + efficiency bonus in [0, 1)
+        # Bonus rewards fewer average steps per food (normalized by starvation limit)
+        if score > 0:
+            avg_steps_per_food = steps_at_last_food / score
+            efficiency_bonus = 10.0 - 10.0*avg_steps_per_food / 150.0
+            if efficiency_bonus < 0.0:
+                efficiency_bonus = 0.0
+        else:
+            efficiency_bonus = 0.0
+        fitness = score + efficiency_bonus
+
+        total_score += fitness
+        if fitness > best_fitness:
+            best_fitness = fitness
+            best_food_score = score
             best_actions = actions
             best_food_positions = food_positions
 
-    # Build GameRecord for the best game (convert int actions to Action enums)
+    # Build GameRecord for the best game
     action_enums = [Action.LEFT, Action.RIGHT, Action.NOTHING]
     best_record = GameRecord(
         initial_position=start_pos,
         initial_direction=(1, 0),
         actions=[action_enums[i] for i in best_actions],
         food_positions=[tuple(p) for p in best_food_positions],
-        final_score=best_score,
+        final_score=best_food_score,
         total_steps=len(best_actions),
     )
 
@@ -763,11 +822,7 @@ def _fast_evaluate(w, b, board_size, num_trials):
 
 
 def _evaluate_brain_worker(args):
-    """Worker function for parallel brain evaluation.
-
-    Receives (w, b, board_size, num_trials) where w and b are Python lists.
-    Returns (avg_score, best_game_record).
-    """
+    """Worker function for parallel brain evaluation."""
     return _fast_evaluate(*args)
 
 
@@ -797,7 +852,6 @@ class GeneticAlgorithm:
             num_workers = min(mp.cpu_count(), population_size)
         self.num_workers = num_workers
 
-        # Only create a process pool if using multiple workers
         if self.num_workers > 1:
             self._executor = ProcessPoolExecutor(max_workers=self.num_workers)
         else:
@@ -807,6 +861,18 @@ class GeneticAlgorithm:
         """Shut down the worker pool."""
         if self._executor:
             self._executor.shutdown(wait=False)
+
+    def seed_population(self, seed_brain: SnakeBrain, board_size: int):
+        """Create initial population from a seed brain: 1 exact copy + mutated clones."""
+        seed_weights = self._extract_weights(seed_brain)
+        self.population = []
+        for i in range(self.population_size):
+            brain = SnakeBrain(board_size)
+            weights = [w.copy() for w in seed_weights]
+            if i > 0:  # keep first one as exact copy
+                self._mutate(weights)
+            self._inject_weights(brain, weights)
+            self.population.append(brain)
 
     def _extract_weights(self, brain: SnakeBrain) -> List[np.ndarray]:
         """Extract weights from a brain as numpy arrays."""
@@ -837,24 +903,22 @@ class GeneticAlgorithm:
     def evolve_population(self, board_size: int, visualizer: Optional[SnakeVisualizer] = None) -> SnakeGenetics:
         """Run one generation of evolution."""
         # Initialize population if first generation
-        if self.generation == 0:
+        if self.generation == 0 and not hasattr(self, 'population'):
             self.population = [SnakeBrain(board_size) for _ in range(self.population_size)]
 
         # Evaluate all brains
         print(f"\nEvaluating Generation {self.generation}")
         gen_start = time.time()
 
-        # Extract weights as Python lists (lightweight, fast to pickle)
+        # Extract weights as Python lists (4 arrays: wh, bh, wo, bo)
         work_items = [
             (*brain.get_fast_weights(), board_size, 20)
             for brain in self.population
         ]
 
         if self._executor is not None:
-            # Parallel evaluation
             results = list(self._executor.map(_evaluate_brain_worker, work_items))
         else:
-            # Sequential evaluation (--workers 1)
             results = [_fast_evaluate(*item) for item in work_items]
 
         scores = [r[0] for r in results]
@@ -888,7 +952,6 @@ class GeneticAlgorithm:
 
         # Create rest of new population
         while len(new_population) < self.population_size:
-            # Select parents (bias towards better performing individuals)
             parent1_idx = int(np.random.exponential(scale=self.population_size/25))
             parent2_idx = int(np.random.exponential(scale=self.population_size/25))
             parent1_idx = min(parent1_idx, len(self.population) - 1)
@@ -897,26 +960,19 @@ class GeneticAlgorithm:
             parent1 = self.population[parent1_idx]
             parent2 = self.population[parent2_idx]
 
-            # Create child through crossover
             child = SnakeBrain(board_size)
             child_weights = self._crossover(
                 self._extract_weights(parent1),
                 self._extract_weights(parent2)
             )
-
-            # Apply mutation
             self._mutate(child_weights)
-
-            # Inject weights into child
             self._inject_weights(child, child_weights)
 
             new_population.append(child)
 
-        # Update population
         self.population = new_population
         self.generation += 1
 
-        # Return statistics
         return SnakeGenetics(
             generation=self.generation - 1,
             scores=scores,
@@ -929,27 +985,41 @@ class GeneticAlgorithm:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Evolve neural networks to play Snake (optimized)")
+    parser = argparse.ArgumentParser(
+        description="Evolve neural networks to play Snake (enhanced spatial awareness)")
 
     # Evolution parameters
-    parser.add_argument("--generations", type=int, default=100, help="Number of generations to run (default: 100)")
-    parser.add_argument("--population", type=int, default=50, help="Population size (default: 50)")
+    parser.add_argument("--generations", type=int, default=100,
+                        help="Number of generations to run (default: 100)")
+    parser.add_argument("--population", type=int, default=100,
+                        help="Population size (default: 100)")
     parser.add_argument("--workers", type=int, default=None,
                         help="Number of worker processes (default: CPU count). Use 1 for sequential.")
 
     # Visualization parameters
     parser.add_argument("--no-viz", action="store_true", help="Disable visualization")
-    parser.add_argument("--show-every", type=int, default=5, help="Show best game every N generations (default: 5)")
-    parser.add_argument("--show-after", type=int, default=15, help="Start showing replays after generation N (default: 15)")
-    parser.add_argument("--only-new", action="store_true", help="Only replay when the best game has improved since last replay")
+    parser.add_argument("--show-every", type=int, default=5,
+                        help="Show best game every N generations (default: 5)")
+    parser.add_argument("--show-after", type=int, default=15,
+                        help="Start showing replays after generation N (default: 15)")
+    parser.add_argument("--only-new", action="store_true",
+                        help="Only replay when the best game has improved since last replay")
 
     # Output parameters
-    parser.add_argument("--output-dir", type=str, default="./output", help="Directory to save results (default: ./output)")
+    parser.add_argument("--output-dir", type=str, default="./output",
+                        help="Directory to save results (default: ./output)")
+
+    # Seed brain for evolution
+    parser.add_argument("--seed-brain", type=str, default=None,
+                        help="Path to a best_brain.pt to seed the initial population (clones + mutations)")
 
     # Load and replay modes
-    parser.add_argument("--load-brain", type=str, default=None, help="Path to a best_brain.pt file to play games with")
-    parser.add_argument("--num-games", type=int, default=1, help="Number of games to play with loaded brain (default: 1)")
-    parser.add_argument("--replay", type=str, default=None, help="Path to a best_game.json file to replay")
+    parser.add_argument("--load-brain", type=str, default=None,
+                        help="Path to a best_brain.pt file to play games with")
+    parser.add_argument("--num-games", type=int, default=1,
+                        help="Number of games to play with loaded brain (default: 1)")
+    parser.add_argument("--replay", type=str, default=None,
+                        help="Path to a best_game.json file to replay")
 
     args = parser.parse_args()
     board_size = 20
@@ -991,46 +1061,44 @@ def main():
     # --- Evolution mode ---
     show_visualization = not args.no_viz
 
-    # Create genetic algorithm
     ga = GeneticAlgorithm(population_size=args.population, num_workers=args.workers)
 
-    # Create visualizer only if visualization is enabled
+    if args.seed_brain:
+        print(f"Seeding population from {args.seed_brain}")
+        seed_brain = SnakeBrain(board_size)
+        seed_brain.load_state_dict(torch.load(args.seed_brain, weights_only=True))
+        ga.seed_population(seed_brain, board_size)
+
     visualizer = None
     if show_visualization:
         _ensure_pygame()
         visualizer = SnakeVisualizer(cell_size=30)
 
-    # Keep track of best game ever and best brain
     best_game_ever = None
     best_score_ever = float('-inf')
     best_brain_ever = None
     last_replayed_score = float('-inf')
 
     try:
-        # Evolution loop
         for gen in range(args.generations):
-            # Evolve population (evaluate without visualization)
             stats = ga.evolve_population(board_size, None)
 
-            # Check if this is the best game ever
             if stats.best_score > best_score_ever:
                 best_score_ever = stats.best_score
                 best_game_ever = stats.best_game
                 best_brain_ever = copy.deepcopy(ga.population[0])
 
-            # Print statistics
             print(f"\nGeneration {stats.generation} Statistics:")
             print(f"Best Score: {stats.best_score:.2f}")
             print(f"Average Score: {stats.average_score:.2f}")
             print(f"Worst Score: {stats.worst_score:.2f}")
 
-            # Show replay of the best game if visualization is enabled
             if show_visualization and best_game_ever and gen % args.show_every == 0 and gen > args.show_after:
                 if not args.only_new or best_score_ever > last_replayed_score:
                     print("Replaying best game ever...")
                     visualizer.replay_game(best_game_ever, speed_ms=50)
                     last_replayed_score = best_score_ever
-                    time.sleep(1)  # Pause between generations
+                    time.sleep(1)
 
     except KeyboardInterrupt:
         print("\nEvolution interrupted by user")
