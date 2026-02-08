@@ -2,6 +2,8 @@ import copy
 import json
 import os
 import warnings
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 import numpy as np
 from typing import List, Tuple, Optional
@@ -13,8 +15,17 @@ from enum import Enum
 import random
 import time
 
-warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
-import pygame
+# Lazy pygame import — workers never load pygame
+pygame = None
+
+def _ensure_pygame():
+    """Import pygame on demand (main process only)."""
+    global pygame
+    if pygame is None:
+        warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
+        import pygame as _pg
+        pygame = _pg
+
 
 class Action(Enum):
     LEFT = 'L'   # Turn left relative to current direction
@@ -74,10 +85,10 @@ class SnakeGame:
         self.board_size = board_size
         self.cell_size = cell_size
         self.window_size = board_size * cell_size
-        
+
         # Game state
         self.reset()
-        
+
         # Direction mappings for relative turns
         self.direction_map = {
             Action.LEFT: self._turn_left,
@@ -92,7 +103,7 @@ class SnakeGame:
             initial_position = (self.board_size // 2, self.board_size // 2)
         if initial_direction is None:
             initial_direction = (1, 0)  # Start moving right
-            
+
         self.snake_positions = [initial_position]
         self.current_direction = initial_direction
         self.food_position = self._spawn_food()
@@ -101,7 +112,7 @@ class SnakeGame:
         self.steps_without_food = 0
         self.game_over = False
         self.growth_remaining = 0
-        
+
         # Additional debug info
         self.hit_wall = False
         self.self_collision = False
@@ -110,7 +121,7 @@ class SnakeGame:
         """Spawn food at given position or random position if None."""
         if position is not None:
             return position
-            
+
         available_positions = [
             (x, y) for x in range(self.board_size) for y in range(self.board_size)
             if (x, y) not in self.snake_positions
@@ -120,7 +131,7 @@ class SnakeGame:
     def _turn_left(self, direction: Tuple[int, int]) -> Tuple[int, int]:
         """Turn 90 degrees left relative to current direction."""
         return (-direction[1], direction[0])
-    
+
     def _turn_right(self, direction: Tuple[int, int]) -> Tuple[int, int]:
         """Turn 90 degrees right relative to current direction."""
         return (direction[1], -direction[0])
@@ -139,19 +150,19 @@ class SnakeGame:
     def get_occupancy_map(self) -> np.ndarray:
         """Return the current occupancy map (for AI input)."""
         occupancy = np.zeros((self.board_size, self.board_size), dtype=int)
-        
+
         # Mark snake body
         for x, y in self.snake_positions[:-1]:
             occupancy[y, x] = 1
-        
+
         # Mark snake head with 2
         head_x, head_y = self.snake_positions[-1]
         occupancy[head_y, head_x] = 2
-        
+
         # Mark food with 3
         food_x, food_y = self.food_position
         occupancy[food_y, food_x] = 3
-        
+
         return occupancy
 
     def step(self, action: Action) -> bool:
@@ -166,7 +177,7 @@ class SnakeGame:
         head_x, head_y = self.snake_positions[-1]
         new_x = head_x + self.current_direction[0]
         new_y = head_y + self.current_direction[1]
-        
+
         # Check wall collision
         if new_x < 0 or new_x >= self.board_size or new_y < 0 or new_y >= self.board_size:
             self.game_over = True
@@ -183,14 +194,14 @@ class SnakeGame:
 
         # Move snake
         self.snake_positions.append(new_head)
-        
+
         # Check if food is eaten
         if new_head == self.food_position:
             self.score += 1
             self.steps_without_food = 0
             self.growth_remaining += 1
             self.food_position = self._spawn_food()
-        
+
         # Handle snake growth
         if self.growth_remaining > 0:
             self.growth_remaining -= 1
@@ -210,7 +221,7 @@ class SnakeBrain(nn.Module):
     def __init__(self, board_size: int):
         super().__init__()
         self.board_size = board_size
-        
+
         # Input features (6 binary inputs):
         # 1. Food is straight ahead
         # 2. Food is to the left
@@ -219,32 +230,32 @@ class SnakeBrain(nn.Module):
         # 5. Death if turn left
         # 6. Death if turn right
         input_size = 6
-        
+
         # Simple network with one hidden layer
         self.fc1 = nn.Linear(input_size, 3)  # 3 outputs for LEFT, RIGHT, NOTHING
-        
+
         # Initialize with random weights
         self.apply(self._init_weights)
-    
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.uniform_(module.weight, -1, 1)
             if module.bias is not None:
                 nn.init.uniform_(module.bias, -1, 1)
-    
+
     def _check_death(self, occupancy_map: np.ndarray, pos: Tuple[int, int], direction: Tuple[int, int]) -> bool:
         """Check if moving in the given direction from pos leads to death."""
         new_x = pos[0] + direction[0]
         new_y = pos[1] + direction[1]
-        
+
         # Check wall collision
         if new_x < 0 or new_x >= self.board_size or new_y < 0 or new_y >= self.board_size:
             return True
-        
+
         # Check self collision
         return occupancy_map[new_y, new_x] == 1
-    
-    def _get_relative_food_direction(self, head_pos: Tuple[int, int], food_pos: Tuple[int, int], 
+
+    def _get_relative_food_direction(self, head_pos: Tuple[int, int], food_pos: Tuple[int, int],
                                    current_direction: Tuple[int, int]) -> Tuple[bool, bool, bool]:
         """
         Determine if food is straight ahead, to the left, or to the right relative to current direction.
@@ -252,22 +263,22 @@ class SnakeBrain(nn.Module):
         """
         dx = food_pos[0] - head_pos[0]
         dy = food_pos[1] - head_pos[1]
-        
+
         # Convert current direction to angle
         current_angle = np.arctan2(current_direction[1], current_direction[0])
         # Convert food direction to angle
         food_angle = np.arctan2(dy, dx)
-        
+
         # Calculate relative angle
         angle_diff = (food_angle - current_angle + np.pi) % (2 * np.pi) - np.pi
-        
+
         # Check directions
         straight = abs(angle_diff) < np.pi/4
         left = angle_diff > np.pi/4 and angle_diff < 3*np.pi/4
         right = angle_diff < -np.pi/4 and angle_diff > -3*np.pi/4
-        
+
         return straight, left, right
-    
+
     def _get_input_features(self, occupancy_map: np.ndarray, current_direction: Tuple[int, int]) -> torch.Tensor:
         """Get binary input features for the neural network."""
         # Find head position
@@ -277,22 +288,22 @@ class SnakeBrain(nn.Module):
         # Find food position
         fy, fx = np.where(occupancy_map == 3)
         food_pos = (int(fx[0]), int(fy[0]))
-        
+
         # Get food direction relative to snake's current direction
         food_straight, food_left, food_right = self._get_relative_food_direction(head_pos, food_pos, current_direction)
-        
+
         # Check death conditions for different moves
         # For straight ahead
         death_straight = self._check_death(occupancy_map, head_pos, current_direction)
-        
+
         # For left turn
         left_dir = (-current_direction[1], current_direction[0])  # Rotate 90° left
         death_left = self._check_death(occupancy_map, head_pos, left_dir)
-        
+
         # For right turn
         right_dir = (current_direction[1], -current_direction[0])  # Rotate 90° right
         death_right = self._check_death(occupancy_map, head_pos, right_dir)
-        
+
         # Create input tensor
         inputs = torch.tensor([
             float(food_straight),
@@ -302,28 +313,28 @@ class SnakeBrain(nn.Module):
             float(death_left),
             float(death_right)
         ], dtype=torch.float32)
-        
+
         return inputs
-    
+
     def forward(self, x):
         x = F.softmax(self.fc1(x), dim=1)
         return x
-    
+
     def get_action(self, occupancy_map: np.ndarray, current_direction: Tuple[int, int]) -> Action:
         """Convert network output to snake action."""
         # Get input features
         input_features = self._get_input_features(occupancy_map, current_direction)
-        
+
         # Add batch dimension
         x = input_features.unsqueeze(0)
-        
+
         # Get network prediction
         with torch.no_grad():
             action_probs = self(x)
-        
+
         # Convert to numpy and get action index
         action_idx = action_probs.numpy().argmax()
-        
+
         # Map index to action (only 3 actions now)
         actions = [Action.LEFT, Action.RIGHT, Action.NOTHING]
         return actions[action_idx]
@@ -344,6 +355,7 @@ class SnakeVisualizer:
         self.board_size = None
 
     def initialize(self):
+        _ensure_pygame()
         if not pygame.get_init():
             pygame.init()
         if not pygame.font.get_init():
@@ -359,6 +371,7 @@ class SnakeVisualizer:
         pygame.display.set_caption('Snake Game')
 
     def cleanup(self):
+        _ensure_pygame()
         pygame.quit()
         self.screen = None
         self.font = None
@@ -366,36 +379,36 @@ class SnakeVisualizer:
     def draw_state(self, state: GameState):
         if not self.screen:
             self.setup_display(self.board_size)
-            
+
         self.screen.fill(self.colors['background'])
-        
+
         # Draw snake body
         for x, y in state.snake_positions[:-1]:
             pygame.draw.rect(self.screen, self.colors['snake'],
                            (x * self.cell_size, y * self.cell_size,
                             self.cell_size, self.cell_size))
-        
+
         # Draw snake head
         head_x, head_y = state.snake_positions[-1]
         pygame.draw.rect(self.screen, self.colors['head'],
                         (head_x * self.cell_size, head_y * self.cell_size,
                          self.cell_size, self.cell_size))
-        
+
         # Draw food
         food_x, food_y = state.food_position
         pygame.draw.rect(self.screen, self.colors['food'],
                         (food_x * self.cell_size, food_y * self.cell_size,
                          self.cell_size, self.cell_size))
-        
+
         # Draw grid
         for i in range(self.board_size + 1):
-            pygame.draw.line(self.screen, (50, 50, 50), 
-                           (i * self.cell_size, 0), 
+            pygame.draw.line(self.screen, (50, 50, 50),
+                           (i * self.cell_size, 0),
                            (i * self.cell_size, self.window_size))
-            pygame.draw.line(self.screen, (50, 50, 50), 
-                           (0, i * self.cell_size), 
+            pygame.draw.line(self.screen, (50, 50, 50),
+                           (0, i * self.cell_size),
                            (self.window_size, i * self.cell_size))
-        
+
         pygame.display.flip()
 
     def clear_info_area(self):
@@ -407,9 +420,9 @@ class SnakeVisualizer:
     def draw_info(self, text: str):
         if not self.screen or not self.font:
             return
-        
+
         self.clear_info_area()
-            
+
         x = self.window_size + 10
         y = 10
         for line in text.split('\n'):
@@ -422,33 +435,33 @@ class SnakeVisualizer:
         """Replay a recorded game with fixed food positioning."""
         try:
             self.setup_display(20)  # Use standard board size
-            
+
             game = SnakeGame(board_size=self.board_size, cell_size=self.cell_size)
             game.reset(game_record.initial_position, game_record.initial_direction)
-            
+
             # Initialize with first food position
             food_index = 0
             game.food_position = game_record.food_positions[food_index]
-            
+
             clock = pygame.time.Clock()
             running = True
             action_index = 0
-            
+
             while running and action_index < len(game_record.actions):
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         running = False
                         break
-                
+
                 if not running:
                     break
-                
+
                 # Get the next action from the record
                 action = game_record.actions[action_index]
-                
+
                 # Get current state before step for visualization
                 current_state = game.get_state()
-                
+
                 # Visualize current state and info
                 self.draw_state(current_state)
                 self.draw_info(
@@ -459,7 +472,7 @@ class SnakeVisualizer:
                     f"Head: {game.snake_positions[-1]}\n"
                     f"Food: {game.food_position}"
                 )
-                
+
                 # Perform the action
                 if game.step(action):
                     # Check if food was eaten
@@ -467,7 +480,7 @@ class SnakeVisualizer:
                         food_index += 1
                         if food_index < len(game_record.food_positions):
                             game.food_position = game_record.food_positions[food_index]
-                    
+
                     action_index += 1
                     clock.tick(1000 / speed_ms)
                 else:
@@ -484,61 +497,29 @@ class SnakeVisualizer:
                     pygame.display.flip()
                     time.sleep(2)
                     break
-                
+
         finally:
             self.cleanup()
 
-def simulate_game(brain: SnakeBrain, game: SnakeGame, visualizer: Optional[SnakeVisualizer] = None, 
-                 speed_ms: int = 100) -> GameRecord:
-    """Simulate a full game and record all states and actions."""
+
+def simulate_game_headless(brain: SnakeBrain, game: SnakeGame) -> GameRecord:
+    """Simulate a full game without visualization. Used by worker processes."""
     actions = []
     food_positions = [game.food_position]
     initial_position = game.snake_positions[0]
     initial_direction = game.current_direction
-    
-    clock = pygame.time.Clock() if visualizer else None
-    
+
     while not game.game_over:
         occupancy = game.get_occupancy_map()
         action = brain.get_action(occupancy, game.current_direction)
         actions.append(action)
-        
-        if visualizer:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    return None
-            
-            visualizer.draw_state(game.get_state())
-            visualizer.draw_info(
-                f"Score: {game.score}  Steps: {len(actions)}\n"
-                f"Direction: {game.current_direction}\n"
-                f"Action: {action.value}\n"
-                f"Steps without food: {game.steps_without_food}"
-            )
-            clock.tick(1000 / speed_ms)
-        
-        # Store food position before step
+
         prev_food = game.food_position
-        
         if not game.step(action):
-            if visualizer:
-                visualizer.draw_state(game.get_state())
-                visualizer.draw_info(
-                    f"GAME OVER!\n"
-                    f"Final Score: {game.score}  Steps: {len(actions)}\n"
-                    f"Hit wall: {game.hit_wall}\n"
-                    f"Self collision: {game.self_collision}\n"
-                    f"Stuck: {game.steps_without_food >= 50}"
-                )
-                pygame.display.flip()
-                time.sleep(2)
             break
-        
-        # Record new food position if it changed
         if game.food_position != prev_food:
             food_positions.append(game.food_position)
-    
+
     return GameRecord(
         initial_position=initial_position,
         initial_direction=initial_direction,
@@ -548,6 +529,100 @@ def simulate_game(brain: SnakeBrain, game: SnakeGame, visualizer: Optional[Snake
         total_steps=len(actions)
     )
 
+
+def simulate_game(brain: SnakeBrain, game: SnakeGame, visualizer: Optional[SnakeVisualizer] = None,
+                 speed_ms: int = 100) -> GameRecord:
+    """Simulate a full game with optional visualization (main process only)."""
+    if visualizer is None:
+        return simulate_game_headless(brain, game)
+
+    _ensure_pygame()
+    actions = []
+    food_positions = [game.food_position]
+    initial_position = game.snake_positions[0]
+    initial_direction = game.current_direction
+
+    clock = pygame.time.Clock()
+
+    while not game.game_over:
+        occupancy = game.get_occupancy_map()
+        action = brain.get_action(occupancy, game.current_direction)
+        actions.append(action)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return None
+
+        visualizer.draw_state(game.get_state())
+        visualizer.draw_info(
+            f"Score: {game.score}  Steps: {len(actions)}\n"
+            f"Direction: {game.current_direction}\n"
+            f"Action: {action.value}\n"
+            f"Steps without food: {game.steps_without_food}"
+        )
+        clock.tick(1000 / speed_ms)
+
+        # Store food position before step
+        prev_food = game.food_position
+
+        if not game.step(action):
+            visualizer.draw_state(game.get_state())
+            visualizer.draw_info(
+                f"GAME OVER!\n"
+                f"Final Score: {game.score}  Steps: {len(actions)}\n"
+                f"Hit wall: {game.hit_wall}\n"
+                f"Self collision: {game.self_collision}\n"
+                f"Stuck: {game.steps_without_food >= 50}"
+            )
+            pygame.display.flip()
+            time.sleep(2)
+            break
+
+        # Record new food position if it changed
+        if game.food_position != prev_food:
+            food_positions.append(game.food_position)
+
+    return GameRecord(
+        initial_position=initial_position,
+        initial_direction=initial_direction,
+        actions=actions,
+        food_positions=food_positions,
+        final_score=game.score,
+        total_steps=len(actions)
+    )
+
+
+def _evaluate_brain_worker(args):
+    """
+    Worker function for parallel brain evaluation.
+    Receives (weights_numpy, board_size, num_trials), returns (avg_score, best_game_record).
+    weights_numpy is a list of (name, numpy_array) pairs to avoid PyTorch pickling issues.
+    """
+    weights_numpy, board_size, num_trials = args
+
+    brain = SnakeBrain(board_size)
+    state_dict = {name: torch.from_numpy(arr) for name, arr in weights_numpy}
+    brain.load_state_dict(state_dict)
+    brain.eval()
+
+    game = SnakeGame(board_size=board_size)
+
+    total_score = 0
+    best_score = float('-inf')
+    best_record = None
+
+    with torch.no_grad():
+        for trial in range(num_trials):
+            game.reset()
+            game_record = simulate_game_headless(brain, game)
+            score = game_record.final_score
+            total_score += score
+            if score > best_score:
+                best_score = score
+                best_record = game_record
+
+    return total_score / num_trials, best_record
 
 
 @dataclass
@@ -560,56 +635,42 @@ class SnakeGenetics:
     best_game: GameRecord
 
 class GeneticAlgorithm:
-    def __init__(self, 
+    def __init__(self,
                  population_size: int = 100,
                  elite_size: int = 10,
                  mutation_rate: float = 0.15,
-                 mutation_strength: float = 0.1):
+                 mutation_strength: float = 0.1,
+                 num_workers: int = None):
         self.population_size = population_size
         self.elite_size = elite_size
         self.mutation_rate = mutation_rate
         self.mutation_strength = mutation_strength
         self.generation = 0
-        
-    def _evaluate_brain(self, brain: SnakeBrain, num_trials: int = 20, visualizer: Optional[SnakeVisualizer] = None) -> Tuple[float, Optional[GameRecord]]:
-        """Evaluate a single brain by running multiple games and averaging the scores."""
-        total_score = 0
-        best_score = float('-inf')
-        best_record = None
-        game = SnakeGame(board_size=brain.board_size)
-        
-        for trial in range(num_trials):
-            game.reset()
-            # Use visualizer only on last trial if it's provided
-            current_visualizer = visualizer if trial == num_trials - 1 else None
-            game_record = simulate_game(brain, game, current_visualizer)
-            #print(game_record.final_score)
-            score = game_record.final_score#(game_record.final_score+1)*game_record.total_steps
-            
-            total_score += score
-            
-            # Keep track of best performance
-            if score > best_score:
-                best_score = score
-                best_record = game_record
-            
-        return total_score / num_trials, best_record
+        if num_workers is None:
+            num_workers = min(mp.cpu_count(), population_size)
+        self.num_workers = num_workers
+        self._executor = ProcessPoolExecutor(max_workers=self.num_workers)
+
+    def shutdown(self):
+        """Shut down the worker pool."""
+        self._executor.shutdown(wait=False)
+
     def _extract_weights(self, brain: SnakeBrain) -> List[np.ndarray]:
         """Extract weights from a brain as numpy arrays."""
-        return [p.data.numpy().copy() for p in brain.parameters()]  # Added .copy() for deep copy
+        return [p.data.numpy().copy() for p in brain.parameters()]
 
     def _inject_weights(self, brain: SnakeBrain, weights: List[np.ndarray]):
         """Inject weights into a brain."""
         for param, weight in zip(brain.parameters(), weights):
-            param.data = torch.from_numpy(weight.copy())  # Added .copy() for deep copy
+            param.data = torch.from_numpy(weight.copy())
 
-    def _crossover(self, parent1_weights: List[np.ndarray], 
+    def _crossover(self, parent1_weights: List[np.ndarray],
                   parent2_weights: List[np.ndarray]) -> List[np.ndarray]:
         """Perform crossover between two parents' weights."""
         child_weights = []
         for w1, w2 in zip(parent1_weights, parent2_weights):
             mask = np.random.rand(*w1.shape) < 0.5
-            child_w = np.where(mask, w1, w2).copy()  # Added .copy() for deep copy
+            child_w = np.where(mask, w1, w2).copy()
             child_weights.append(child_w)
         return child_weights
 
@@ -621,49 +682,53 @@ class GeneticAlgorithm:
             w[mutation_mask] += mutations[mutation_mask]
 
     def evolve_population(self, board_size: int, visualizer: Optional[SnakeVisualizer] = None) -> SnakeGenetics:
-        """Run one generation of evolution."""
+        """Run one generation of evolution with parallel evaluation."""
         # Initialize population if first generation
         if self.generation == 0:
             self.population = [SnakeBrain(board_size) for _ in range(self.population_size)]
-            
-        # Evaluate all brains
+
+        # Evaluate all brains in parallel
         print(f"\nEvaluating Generation {self.generation}")
-        scores = []
-        game_records = []
-        
-        # Evaluate each brain
-        for i, brain in enumerate(self.population):
-            print(f"Evaluating Snake {i+1}/{self.population_size}", end='\r')
-            
-            # Run evaluation trials
-            score, game_record = self._evaluate_brain(brain, visualizer=None)
-            scores.append(score)
-            game_records.append(game_record)
-        
+        gen_start = time.time()
+
+        # Prepare work items: convert weights to numpy to avoid PyTorch shm pickling issues
+        work_items = [
+            ([(name, param.numpy().copy()) for name, param in brain.state_dict().items()], board_size, 20)
+            for brain in self.population
+        ]
+
+        # Parallel evaluation
+        results = list(self._executor.map(_evaluate_brain_worker, work_items))
+
+        scores = [r[0] for r in results]
+        game_records = [r[1] for r in results]
+
+        gen_elapsed = time.time() - gen_start
+        print(f"  Evaluated {self.population_size} brains in {gen_elapsed:.1f}s "
+              f"({self.num_workers} workers)")
+
         # Sort population, scores, and game records together
-        sorted_data = sorted(zip(scores, self.population, game_records), 
+        sorted_data = sorted(zip(scores, self.population, game_records),
                            key=lambda x: x[0], reverse=True)
         scores, self.population, game_records = zip(*sorted_data)
         scores = list(scores)
         self.population = list(self.population)
         game_records = list(game_records)
-        
-        # Now visualize the actual best performing snake
+
+        # Visualize best snake (main process only)
         if visualizer:
             print("\nReplicating best snake's performance...")
-            best_score, best_record = self._evaluate_brain(
-                self.population[0],  # Best snake after sorting
-                num_trials=1,  # Single trial for visualization
-                visualizer=visualizer
-            )
-            game_records[0] = best_record  # Update the record with the visualized performance
-        
+            game = SnakeGame(board_size=board_size)
+            game.reset()
+            best_record = simulate_game(self.population[0], game, visualizer=visualizer)
+            game_records[0] = best_record
+
         # Create next generation
         new_population = []
-        
+
         # Keep elite individuals
         new_population.extend(copy.deepcopy(self.population[:self.elite_size]))
-        
+
         # Create rest of new population
         while len(new_population) < self.population_size:
             # Select parents (bias towards better performing individuals)
@@ -671,29 +736,29 @@ class GeneticAlgorithm:
             parent2_idx = int(np.random.exponential(scale=self.population_size/25))
             parent1_idx = min(parent1_idx, len(self.population) - 1)
             parent2_idx = min(parent2_idx, len(self.population) - 1)
-            
+
             parent1 = self.population[parent1_idx]
             parent2 = self.population[parent2_idx]
-            
+
             # Create child through crossover
             child = SnakeBrain(board_size)
             child_weights = self._crossover(
                 self._extract_weights(parent1),
                 self._extract_weights(parent2)
             )
-            
+
             # Apply mutation
             self._mutate(child_weights)
-            
+
             # Inject weights into child
             self._inject_weights(child, child_weights)
-            
+
             new_population.append(child)
-        
+
         # Update population
         self.population = new_population
         self.generation += 1
-        
+
         # Return statistics
         return SnakeGenetics(
             generation=self.generation - 1,
@@ -701,17 +766,18 @@ class GeneticAlgorithm:
             best_score=max(scores),
             average_score=sum(scores) / len(scores),
             worst_score=min(scores),
-            best_game=game_records[0]  # Record of the best snake
+            best_game=game_records[0]
         )
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Evolve neural networks to play Snake")
+    parser = argparse.ArgumentParser(description="Evolve neural networks to play Snake (parallelized)")
 
     # Evolution parameters
     parser.add_argument("--generations", type=int, default=100, help="Number of generations to run (default: 100)")
     parser.add_argument("--population", type=int, default=50, help="Population size (default: 50)")
+    parser.add_argument("--workers", type=int, default=None, help="Number of worker processes (default: CPU count)")
 
     # Visualization parameters
     parser.add_argument("--no-viz", action="store_true", help="Disable visualization")
@@ -732,6 +798,7 @@ def main():
 
     # --- Replay mode ---
     if args.replay:
+        _ensure_pygame()
         print(f"Loading game record from {args.replay}")
         game_record = load_game_record(args.replay)
         print(f"Game score: {game_record.final_score}, steps: {game_record.total_steps}")
@@ -741,6 +808,7 @@ def main():
 
     # --- Load brain mode ---
     if args.load_brain:
+        _ensure_pygame()
         print(f"Loading brain from {args.load_brain}")
         brain = SnakeBrain(board_size)
         brain.load_state_dict(torch.load(args.load_brain, weights_only=True))
@@ -766,11 +834,12 @@ def main():
     show_visualization = not args.no_viz
 
     # Create genetic algorithm
-    ga = GeneticAlgorithm(population_size=args.population)
+    ga = GeneticAlgorithm(population_size=args.population, num_workers=args.workers)
 
     # Create visualizer only if visualization is enabled
     visualizer = None
     if show_visualization:
+        _ensure_pygame()
         visualizer = SnakeVisualizer(cell_size=30)
 
     # Keep track of best game ever and best brain
@@ -808,6 +877,7 @@ def main():
     except KeyboardInterrupt:
         print("\nEvolution interrupted by user")
     finally:
+        ga.shutdown()
         if visualizer:
             visualizer.cleanup()
 
@@ -830,5 +900,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

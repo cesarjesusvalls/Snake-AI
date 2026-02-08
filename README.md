@@ -47,9 +47,11 @@ The `GeneticAlgorithm` class evolves a population of brains:
 
 ```
 SnakeAI/
-├── genetics.py        # Everything: game engine, neural network, genetic algorithm, visualizer
+├── genetics.py        # Game engine, neural network, genetic algorithm, visualizer
 └── requirements.txt   # Python dependencies
 ```
+
+Brain evaluation is parallelized across CPU cores using `ProcessPoolExecutor`.
 
 ## Setup
 
@@ -93,6 +95,7 @@ output/run_20260208_102921/
 |------|-------------|---------|
 | `--generations N` | Number of generations to run | 100 |
 | `--population N` | Population size | 50 |
+| `--workers N` | Worker processes for parallel evaluation | CPU count |
 | `--no-viz` | Disable visualization | off |
 | `--show-every N` | Replay best game every N generations | 5 |
 | `--show-after N` | Start replaying after generation N | 15 |
@@ -107,8 +110,12 @@ output/run_20260208_102921/
 ```bash
 # Run evolution
 python genetics.py --generations 200 --population 100
+
+# Run evolution with specific worker count
+python genetics.py --generations 200 --workers 8
+
+# Headless run
 python genetics.py --no-viz --generations 50
-python genetics.py --only-new --show-every 3
 
 # Replay a saved best game
 python genetics.py --replay output/run_.../best_game.json
