@@ -674,49 +674,58 @@ class GeneticAlgorithm:
         )
 
 
-def main(show_visualization: bool = True):
-    # Parameters
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Evolve neural networks to play Snake")
+    parser.add_argument("--generations", type=int, default=100, help="Number of generations to run (default: 100)")
+    parser.add_argument("--population", type=int, default=50, help="Population size (default: 50)")
+    parser.add_argument("--no-viz", action="store_true", help="Disable visualization")
+    parser.add_argument("--show-every", type=int, default=5, help="Show best game every N generations (default: 5)")
+    parser.add_argument("--show-after", type=int, default=15, help="Start showing replays after generation N (default: 15)")
+    parser.add_argument("--only-new", action="store_true", help="Only replay when the best game has improved since last replay")
+    args = parser.parse_args()
+
     board_size = 20
-    num_generations = 100
-    population_size = 50
-    
+    show_visualization = not args.no_viz
+
     # Create genetic algorithm
-    ga = GeneticAlgorithm(population_size=population_size)
-    
+    ga = GeneticAlgorithm(population_size=args.population)
+
     # Create visualizer only if visualization is enabled
     visualizer = None
     if show_visualization:
         visualizer = SnakeVisualizer(cell_size=30)
-    
+
     # Keep track of best game ever
     best_game_ever = None
     best_score_ever = float('-inf')
-    
+    last_replayed_score = float('-inf')
+
     try:
         # Evolution loop
-        for gen in range(num_generations):
+        for gen in range(args.generations):
             # Evolve population (evaluate without visualization)
             stats = ga.evolve_population(board_size, None)
-            
+
             # Check if this is the best game ever
             if stats.best_score > best_score_ever:
                 best_score_ever = stats.best_score
                 best_game_ever = stats.best_game
-            
+
             # Print statistics
             print(f"\nGeneration {stats.generation} Statistics:")
             print(f"Best Score: {stats.best_score:.2f}")
             print(f"Average Score: {stats.average_score:.2f}")
             print(f"Worst Score: {stats.worst_score:.2f}")
-            
+
             # Show replay of the best game if visualization is enabled
-            if show_visualization and best_game_ever and gen%5==0 and gen>15:
-                print("Replaying best game ever...")
-                #print(best_game_ever)
-                #print(best_game_ever)
-                visualizer.replay_game(best_game_ever, speed_ms=50)
-                time.sleep(1)  # Pause between generations
-            
+            if show_visualization and best_game_ever and gen % args.show_every == 0 and gen > args.show_after:
+                if not args.only_new or best_score_ever > last_replayed_score:
+                    print("Replaying best game ever...")
+                    visualizer.replay_game(best_game_ever, speed_ms=50)
+                    last_replayed_score = best_score_ever
+                    time.sleep(1)  # Pause between generations
+
     except KeyboardInterrupt:
         print("\nEvolution interrupted by user")
     finally:
@@ -724,6 +733,6 @@ def main(show_visualization: bool = True):
             visualizer.cleanup()
 
 if __name__ == "__main__":
-    main(show_visualization=True)
+    main()
 
 
