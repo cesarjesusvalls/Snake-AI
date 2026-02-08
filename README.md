@@ -79,6 +79,14 @@ Average Score: 1.05
 Worst Score: 0.00
 ```
 
+After evolution completes, results are saved to a timestamped folder under `./output/`:
+
+```
+output/run_20260208_102921/
+├── best_brain.pt     # PyTorch state_dict of the best neural network
+└── best_game.json    # Recorded game of the best snake
+```
+
 ### CLI Options
 
 | Flag | Description | Default |
@@ -89,13 +97,24 @@ Worst Score: 0.00
 | `--show-every N` | Replay best game every N generations | 5 |
 | `--show-after N` | Start replaying after generation N | 15 |
 | `--only-new` | Only replay when the best score improves | off |
+| `--output-dir DIR` | Directory to save results | `./output` |
+| `--load-brain PATH` | Load a saved brain and play live games | - |
+| `--num-games N` | Number of games to play with loaded brain | 1 |
+| `--replay PATH` | Replay a saved best game recording | - |
 
-Examples:
+### Examples
 
 ```bash
+# Run evolution
 python genetics.py --generations 200 --population 100
 python genetics.py --no-viz --generations 50
 python genetics.py --only-new --show-every 3
+
+# Replay a saved best game
+python genetics.py --replay output/run_.../best_game.json
+
+# Load a trained brain and watch it play live
+python genetics.py --load-brain output/run_.../best_brain.pt --num-games 5
 ```
 
 ## Dependencies

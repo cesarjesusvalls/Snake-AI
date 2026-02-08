@@ -1,21 +1,18 @@
 import copy
+import json
+import os
+from datetime import datetime
 import numpy as np
-from typing import List, Tuple
-import torch.nn as nn
-import random
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
-
-import pygame
-import numpy as np
-from dataclasses import dataclass
 from typing import List, Tuple, Optional
-from enum import Enum
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
+from enum import Enum
+import random
 import time
+
+import pygame
 
 class Action(Enum):
     LEFT = 'L'   # Turn left relative to current direction
@@ -39,6 +36,36 @@ class GameRecord:
     food_positions: List[Tuple[int, int]]
     final_score: int
     total_steps: int
+
+
+def save_game_record(record: GameRecord, path: str):
+    """Serialize a GameRecord to JSON."""
+    data = {
+        "initial_position": list(record.initial_position),
+        "initial_direction": list(record.initial_direction),
+        "actions": [a.value for a in record.actions],
+        "food_positions": [list(p) for p in record.food_positions],
+        "final_score": record.final_score,
+        "total_steps": record.total_steps,
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_game_record(path: str) -> GameRecord:
+    """Deserialize a GameRecord from JSON."""
+    with open(path, "r") as f:
+        data = json.load(f)
+    action_map = {a.value: a for a in Action}
+    return GameRecord(
+        initial_position=tuple(data["initial_position"]),
+        initial_direction=tuple(data["initial_direction"]),
+        actions=[action_map[v] for v in data["actions"]],
+        food_positions=[tuple(p) for p in data["food_positions"]],
+        final_score=data["final_score"],
+        total_steps=data["total_steps"],
+    )
+
 
 class SnakeGame:
     def __init__(self, board_size: int = 20, cell_size: int = 20):
@@ -677,15 +704,61 @@ class GeneticAlgorithm:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Evolve neural networks to play Snake")
+
+    # Evolution parameters
     parser.add_argument("--generations", type=int, default=100, help="Number of generations to run (default: 100)")
     parser.add_argument("--population", type=int, default=50, help="Population size (default: 50)")
+
+    # Visualization parameters
     parser.add_argument("--no-viz", action="store_true", help="Disable visualization")
     parser.add_argument("--show-every", type=int, default=5, help="Show best game every N generations (default: 5)")
     parser.add_argument("--show-after", type=int, default=15, help="Start showing replays after generation N (default: 15)")
     parser.add_argument("--only-new", action="store_true", help="Only replay when the best game has improved since last replay")
-    args = parser.parse_args()
 
+    # Output parameters
+    parser.add_argument("--output-dir", type=str, default="./output", help="Directory to save results (default: ./output)")
+
+    # Load and replay modes
+    parser.add_argument("--load-brain", type=str, default=None, help="Path to a best_brain.pt file to play games with")
+    parser.add_argument("--num-games", type=int, default=1, help="Number of games to play with loaded brain (default: 1)")
+    parser.add_argument("--replay", type=str, default=None, help="Path to a best_game.json file to replay")
+
+    args = parser.parse_args()
     board_size = 20
+
+    # --- Replay mode ---
+    if args.replay:
+        print(f"Loading game record from {args.replay}")
+        game_record = load_game_record(args.replay)
+        print(f"Game score: {game_record.final_score}, steps: {game_record.total_steps}")
+        visualizer = SnakeVisualizer(cell_size=30)
+        visualizer.replay_game(game_record, speed_ms=50)
+        return
+
+    # --- Load brain mode ---
+    if args.load_brain:
+        print(f"Loading brain from {args.load_brain}")
+        brain = SnakeBrain(board_size)
+        brain.load_state_dict(torch.load(args.load_brain, weights_only=True))
+        brain.eval()
+
+        visualizer = SnakeVisualizer(cell_size=30)
+        visualizer.setup_display(board_size)
+
+        try:
+            for i in range(args.num_games):
+                game = SnakeGame(board_size=board_size)
+                game.reset()
+                print(f"\nGame {i + 1}/{args.num_games}")
+                record = simulate_game(brain, game, visualizer=visualizer, speed_ms=100)
+                if record is None:
+                    break
+                print(f"Score: {record.final_score}, Steps: {record.total_steps}")
+        finally:
+            visualizer.cleanup()
+        return
+
+    # --- Evolution mode ---
     show_visualization = not args.no_viz
 
     # Create genetic algorithm
@@ -696,9 +769,10 @@ def main():
     if show_visualization:
         visualizer = SnakeVisualizer(cell_size=30)
 
-    # Keep track of best game ever
+    # Keep track of best game ever and best brain
     best_game_ever = None
     best_score_ever = float('-inf')
+    best_brain_ever = None
     last_replayed_score = float('-inf')
 
     try:
@@ -711,6 +785,7 @@ def main():
             if stats.best_score > best_score_ever:
                 best_score_ever = stats.best_score
                 best_game_ever = stats.best_game
+                best_brain_ever = copy.deepcopy(ga.population[0])
 
             # Print statistics
             print(f"\nGeneration {stats.generation} Statistics:")
@@ -731,6 +806,23 @@ def main():
     finally:
         if visualizer:
             visualizer.cleanup()
+
+    # Save results
+    if best_brain_ever and best_game_ever:
+        run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+        run_dir = os.path.join(args.output_dir, run_name)
+        os.makedirs(run_dir, exist_ok=True)
+
+        brain_path = os.path.join(run_dir, "best_brain.pt")
+        game_path = os.path.join(run_dir, "best_game.json")
+
+        torch.save(best_brain_ever.state_dict(), brain_path)
+        save_game_record(best_game_ever, game_path)
+
+        print(f"\nResults saved to {run_dir}/")
+        print(f"  Best brain: {brain_path}")
+        print(f"  Best game:  {game_path} (score: {best_score_ever:.2f})")
+
 
 if __name__ == "__main__":
     main()
