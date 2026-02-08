@@ -47,15 +47,9 @@ The `GeneticAlgorithm` class evolves a population of brains:
 
 ```
 SnakeAI/
-├── genetics.py        # Genetic algorithm, neural network, game engine, and visualizer (main entry point)
-├── brain.py           # Earlier prototype with full-grid input (1204 -> 64 -> 32 -> 5 architecture)
-├── visualization.py   # Standalone visualizer with wrapping board variant
-├── main.py            # Demo script that replays a pre-recorded game
-├── test.py            # Testing/experimentation with the evolved architecture
+├── genetics.py        # Everything: game engine, neural network, genetic algorithm, visualizer
 └── requirements.txt   # Python dependencies
 ```
-
-`genetics.py` is the primary file containing the final versions of all components. `brain.py` contains an earlier iteration that used the full occupancy map as input instead of extracted features.
 
 ## Setup
 
@@ -72,8 +66,6 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Run the evolution
-
 ```bash
 python genetics.py
 ```
@@ -87,27 +79,24 @@ Average Score: 1.05
 Worst Score: 0.00
 ```
 
-To run headless (no visualization), edit the `main()` call at the bottom of `genetics.py`:
+### CLI Options
 
-```python
-main(show_visualization=False)
-```
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--generations N` | Number of generations to run | 100 |
+| `--population N` | Population size | 50 |
+| `--no-viz` | Disable visualization | off |
+| `--show-every N` | Replay best game every N generations | 5 |
+| `--show-after N` | Start replaying after generation N | 15 |
+| `--only-new` | Only replay when the best score improves | off |
 
-### Run the demo replay
-
-```bash
-python main.py
-```
-
-Replays a pre-recorded game showing a snake moving in a spiral pattern and eating food.
-
-### Run with a random brain
+Examples:
 
 ```bash
-python brain.py
+python genetics.py --generations 200 --population 100
+python genetics.py --no-viz --generations 50
+python genetics.py --only-new --show-every 3
 ```
-
-Runs 5 games with a single randomly-initialized brain (the earlier full-grid architecture) and visualizes each game.
 
 ## Dependencies
 
