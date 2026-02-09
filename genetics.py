@@ -1020,6 +1020,12 @@ def main():
                         help="Number of games to play with loaded brain (default: 1)")
     parser.add_argument("--replay", type=str, default=None,
                         help="Path to a best_game.json file to replay")
+    parser.add_argument("--gif", type=str, default=None,
+                        help="Path to a best_game.json file to export as GIF")
+    parser.add_argument("--gif-output", type=str, default=None,
+                        help="Output path for GIF (default: same dir as game json)")
+    parser.add_argument("--gif-speed", type=int, default=80,
+                        help="Frame duration in ms for GIF (default: 80)")
 
     args = parser.parse_args()
     board_size = 20
@@ -1032,6 +1038,110 @@ def main():
         print(f"Game score: {game_record.final_score}, steps: {game_record.total_steps}")
         visualizer = SnakeVisualizer(cell_size=30)
         visualizer.replay_game(game_record, speed_ms=50)
+        return
+
+    # --- GIF export mode ---
+    if args.gif:
+        from PIL import Image
+        _ensure_pygame()
+        os.environ['SDL_VIDEODRIVER'] = 'dummy'
+        import pygame
+
+        print(f"Loading game record from {args.gif}")
+        game_record = load_game_record(args.gif)
+        print(f"Game score: {game_record.final_score}, steps: {game_record.total_steps}")
+
+        cell_size = 30
+        window_size = board_size * cell_size
+        colors = {
+            'background': (0, 0, 0),
+            'snake': (0, 180, 0),
+            'head': (0, 255, 0),
+            'food': (255, 0, 0),
+            'text': (255, 255, 255),
+            'grid': (50, 50, 50),
+        }
+
+        pygame.init()
+        pygame.font.init()
+        surface = pygame.Surface((window_size, window_size))
+        font = pygame.font.SysFont('Arial', 16)
+
+        game = SnakeGame(board_size=board_size, cell_size=cell_size)
+        game.reset(game_record.initial_position, game_record.initial_direction)
+        food_index = 0
+        game.food_position = game_record.food_positions[food_index]
+
+        frames = []
+        for action_index, action in enumerate(game_record.actions):
+            # Draw frame
+            surface.fill(colors['background'])
+            for x, y in game.snake_positions[:-1]:
+                pygame.draw.rect(surface, colors['snake'],
+                                 (x * cell_size, y * cell_size, cell_size, cell_size))
+            hx, hy = game.snake_positions[-1]
+            pygame.draw.rect(surface, colors['head'],
+                             (hx * cell_size, hy * cell_size, cell_size, cell_size))
+            fx, fy = game.food_position
+            pygame.draw.rect(surface, colors['food'],
+                             (fx * cell_size, fy * cell_size, cell_size, cell_size))
+            for i in range(board_size + 1):
+                pygame.draw.line(surface, colors['grid'],
+                                 (i * cell_size, 0), (i * cell_size, window_size))
+                pygame.draw.line(surface, colors['grid'],
+                                 (0, i * cell_size), (window_size, i * cell_size))
+            # Score overlay
+            score_text = font.render(f"Score: {game.score}  Step: {action_index}", True, colors['text'])
+            surface.blit(score_text, (5, 5))
+
+            # Capture frame
+            frame_data = pygame.image.tostring(surface, 'RGB')
+            frames.append(Image.frombytes('RGB', (window_size, window_size), frame_data))
+
+            # Step game
+            prev_len = len(game.snake_positions)
+            if not game.step(action):
+                break
+            if len(game.snake_positions) > prev_len:
+                food_index += 1
+                if food_index < len(game_record.food_positions):
+                    game.food_position = game_record.food_positions[food_index]
+
+        # Add a final "game over" frame
+        surface.fill(colors['background'])
+        for x, y in game.snake_positions[:-1]:
+            pygame.draw.rect(surface, colors['snake'],
+                             (x * cell_size, y * cell_size, cell_size, cell_size))
+        hx, hy = game.snake_positions[-1]
+        pygame.draw.rect(surface, colors['head'],
+                         (hx * cell_size, hy * cell_size, cell_size, cell_size))
+        fx, fy = game.food_position
+        pygame.draw.rect(surface, colors['food'],
+                         (fx * cell_size, fy * cell_size, cell_size, cell_size))
+        for i in range(board_size + 1):
+            pygame.draw.line(surface, colors['grid'],
+                             (i * cell_size, 0), (i * cell_size, window_size))
+            pygame.draw.line(surface, colors['grid'],
+                             (0, i * cell_size), (window_size, i * cell_size))
+        over_text = font.render(f"Game Over! Score: {game.score}", True, colors['text'])
+        surface.blit(over_text, (5, 5))
+        frame_data = pygame.image.tostring(surface, 'RGB')
+        final_frame = Image.frombytes('RGB', (window_size, window_size), frame_data)
+        # Hold final frame longer
+        for _ in range(15):
+            frames.append(final_frame)
+
+        pygame.quit()
+
+        # Determine output path
+        if args.gif_output:
+            gif_path = args.gif_output
+        else:
+            gif_path = os.path.splitext(args.gif)[0] + '.gif'
+
+        frames[0].save(gif_path, save_all=True, append_images=frames[1:],
+                       duration=args.gif_speed, loop=0)
+        print(f"GIF saved to {gif_path} ({len(frames)} frames, {args.gif_speed}ms/frame)")
         return
 
     # --- Load brain mode ---
