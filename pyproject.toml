@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neurosnake"
-version = "0.1.0"
+version = "0.1.1"
 description = "Neuroevolution of neural networks to play Snake using genetic algorithms"
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ requires-python = ">=3.9"
 dependencies = [
     "pygame>=2.5.0",
     "torch>=2.0.0",
-    "numpy>=1.24.0,<2.0.0",
+    "numpy>=1.24.0",
     "Pillow>=9.0.0",
 ]
 

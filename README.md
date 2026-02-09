@@ -163,7 +163,7 @@ Brain evaluation is parallelized across CPU cores using `ProcessPoolExecutor`.
 |---------|-------------|--------------------------------|
 | pygame  | >= 2.5.0    | Game visualization & rendering |
 | torch   | >= 2.0.0    | Neural network implementation  |
-| numpy   | >= 1.24, <2 | Numerical operations           |
+| numpy   | >= 1.24     | Numerical operations           |
 | Pillow  | >= 9.0.0    | GIF export                     |
 
 ## License
