@@ -7,7 +7,7 @@ name = "neurosnake"
 version = "0.1.0"
 description = "Neuroevolution of neural networks to play Snake using genetic algorithms"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.9"
 dependencies = [
     "pygame>=2.5.0",
